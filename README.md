@@ -1,6 +1,4 @@
-Msg 207, Level 16, State 1, Line 7
-Invalid column name 'ProviderID'.
-Msg 207, Level 16, State 1, Line 4
-Invalid column name 'ProviderID'.
-Msg 207, Level 16, State 1, Line 5
-Invalid column name 'MOUID'.
+SELECT COLUMN_NAME
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME = 'Claimsdetails'
+ORDER BY ORDINAL_POSITION;
