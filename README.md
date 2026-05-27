@@ -1,9 +1,6 @@
-SELECT TOP 5
-    cd.ClaimID,
-    cd.Slno,
-    cd.ProviderID,
-    cd.MOUID
-FROM Claimsdetails cd WITH(NOLOCK)
-WHERE cd.ProviderID = 156751
-  AND ISNULL(cd.Deleted, 0) = 0
-ORDER BY cd.ClaimID DESC;
+Msg 207, Level 16, State 1, Line 7
+Invalid column name 'ProviderID'.
+Msg 207, Level 16, State 1, Line 4
+Invalid column name 'ProviderID'.
+Msg 207, Level 16, State 1, Line 5
+Invalid column name 'MOUID'.
