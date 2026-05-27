@@ -1,2 +1,7 @@
-Msg 8144, Level 16, State 2, Procedure USP_ClaimMedicalScrutiny_Retrieve, Line 0 [Batch Start Line 0]
-Procedure or function USP_ClaimMedicalScrutiny_retrieve has too many arguments specified.
+SELECT
+    p.parameter_id AS ParamOrder,
+    p.name         AS ParameterName,
+    TYPE_NAME(p.user_type_id) AS DataType
+FROM sys.parameters p
+WHERE p.object_id = OBJECT_ID('USP_ClaimMedicalScrutiny_Retrieve')
+ORDER BY p.parameter_id;
