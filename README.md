@@ -1,8 +1,10 @@
-FileId               MOUID       SlNo                 FileName                                                                                                                                                                                                                                                         UserName                                                                                                                                               UpdateDate              SystemFileName
--------------------- ----------- -------------------- ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- ------------------------------------------------------------------------------------------------------------------------------------------------------ ----------------------- ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-95176                999826      1                    20392 - MICRO ENT HOSPITAL Hyderabad Telangana GIC TARIFF (06 Nov 2025).pdf                                                                                                                                                                                      B srikanth                                                                                                                                             2025-12-02 16:25:55.230 20392_MICRO_ENT_HOSPITAL_11_11_2021_31_12_2034_134091465548888529.pdf
-92967                999826      2                    20392 - MICRO ENT HOSPITAL Hyderabad Telangana  (06 Nov 2025).pdf                                                                                                                                                                                                Damayanthi                                                                                                                                             2025-11-26 19:09:35.433 20392_MICRO_ENT_HOSPITAL_11_11_2021_31_12_2034_134086379751121553.pdf
-51292                999826      3                    20392-Micro ENT Hospital Golconda TS (21-NOV-2024) GIPSA tariff for ALL Insurers.zip                                                                                                                                                                             Dr Mandepudi Alekhya                                                                                                                                   2024-11-22 10:37:14.217 20392_MICRO_ENT_HOSPITAL_11_11_2021_31_12_2034_133767256336341673.zip
-
-
-Completion time: 2026-05-27T18:45:17.9997959+05:30
+SELECT
+    Mp.ProviderId,
+    Doc.FileName,
+    Doc.SystemFileName,
+    CASE WHEN OMp.id IS NOT NULL THEN 'yes' ELSE 'no' END AS IsOldDoc
+FROM ProviderTariffDocs Doc WITH(NOLOCK)
+INNER JOIN ProviderTariff_Map Mp WITH(NOLOCK) ON Doc.Id = Mp.DocumentId
+LEFT JOIN (SELECT * FROM ProviderTariff_Map WITH(NOLOCK) WHERE mouid = 0) OMp
+       ON Doc.id = OMp.documentid
+WHERE Mp.Id = 95176;
