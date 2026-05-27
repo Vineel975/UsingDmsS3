@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Web;
@@ -9193,9 +9193,10 @@ namespace Enrollment.Controllers
                     var cmd = conn.CreateCommand();
                     cmd.CommandType = System.Data.CommandType.StoredProcedure;
                     cmd.CommandText = "USP_ClaimMedicalScrutiny_Retrieve";
+                    // FIX #1: SP signature is (@ClaimID bigint, @Slno tinyint) — only 2 params.
+                    // Removed @IsFrmArchived = 0 which caused "too many arguments specified" error.
                     cmd.Parameters.AddWithValue("@ClaimID", claimIdLong2);
-                    cmd.Parameters.AddWithValue("@SlNo",    slNoInt);
-                    cmd.Parameters.AddWithValue("@IsFrmArchived", 0);
+                    cmd.Parameters.AddWithValue("@Slno",    slNoInt);
                     using (var rdr = cmd.ExecuteReader())
                     {
                         if (rdr.Read())
@@ -9222,26 +9223,84 @@ namespace Enrollment.Controllers
                 string accessKey = System.Configuration.ConfigurationManager.AppSettings["ProviderDocaccesskey"];
                 string secretKey = System.Configuration.ConfigurationManager.AppSettings["ProviderDocsecretkey"];
 
-                // List all tariff files for this provider from Usp_TariffUploadDoc_FillDetails
+                // List all tariff files for this provider.
+                //
+                // FIX #2/#3/#4: Replaced the call to Usp_TariffUploadDoc_FillDetails with a direct
+                // query for three reasons:
+                //   #2 — The SP signature is (@ProviderID int, @MOUID varchar(max),
+                //        @TariffDocId int, @Type varchar(10)). The old code passed @Flag (wrong
+                //        param name) and was missing @Type, causing "expects parameter @TariffDocId"
+                //        error at runtime.
+                //   #3 — The SP result set does NOT contain a FileType column in any branch. The old
+                //        code's "if (!fileType.Contains(\"pdf\")) continue;" check would throw
+                //        IndexOutOfRangeException. We now filter PDFs via Doc.FileName LIKE '%.pdf'
+                //        directly in the WHERE clause.
+                //   #4 — The SP result set does NOT contain an isOldDoc column in branches 2/3/4
+                //        (only branch 1 returns it). The old code's "rdr[\"isOldDoc\"]" read would
+                //        throw IndexOutOfRangeException. We now compute IsOldDoc inline using the
+                //        same logic as branch 1 of the SP body: a doc is "old" if it has a mapping
+                //        with mouid = 0.
+                //
+                // Behavior decisions worth flagging:
+                //   (a) When mouId is non-empty: include both MOU-specific mappings AND mouid=0
+                //       fallback mappings. SP branch 3 only returns MOU-specific. This change is
+                //       intentional — without the fallback, claims whose providers only have
+                //       generic (non-MOU-specific) tariffs would return no files, which is the
+                //       documented complaint that motivated this refactor.
+                //   (b) When mouId is empty: skip the MOU filter entirely (matches SP branch 4
+                //       which returns all files for the provider).
+                //   (c) GROUP BY on Doc.Id deduplicates rows when a document has multiple mappings
+                //       (e.g. mapped to claim's MOU AND mouid=0). Otherwise the foreach loop below
+                //       would download the same S3 object twice.
                 var tariffFiles = new System.Collections.Generic.List<System.Tuple<string, DateTime, string, string>>();
                 using (var conn = new System.Data.SqlClient.SqlConnection(connStr))
                 {
                     conn.Open();
                     var cmd = conn.CreateCommand();
-                    cmd.CommandType = System.Data.CommandType.StoredProcedure;
-                    cmd.CommandText = "Usp_TariffUploadDoc_FillDetails";
+                    cmd.CommandType = System.Data.CommandType.Text;
+
+                    // hasMou is false when mouId is empty OR "-1". This matches SP branch
+                    // condition `@MOUID != '' and @MOUID != '-1'` — both values mean "no MOU
+                    // specified" and trigger the unfiltered branch 4 of the original SP.
+                    bool hasMou = !string.IsNullOrEmpty(mouId) && mouId != "-1";
+                    string mouFilter = hasMou
+                        ? "AND (Mp.MOUID = @MOUID OR Mp.MOUID = 0)"
+                        : ""; // empty/-1 MOU → no filter (matches SP branch 4 behavior)
+
+                    cmd.CommandText = @"
+                        SELECT
+                            Doc.SystemFileName,
+                            Doc.FileName,
+                            MAX(Doc.CreatedDateTime) AS UpdateDate,
+                            MAX(CASE WHEN OMp.id IS NOT NULL THEN 'yes' ELSE 'no' END) AS IsOldDoc
+                        FROM ProviderTariffDocs Doc WITH(NOLOCK)
+                        INNER JOIN ProviderTariff_Map Mp WITH(NOLOCK) ON Doc.Id = Mp.DocumentId
+                        LEFT JOIN (SELECT documentid, id FROM ProviderTariff_Map WITH(NOLOCK) WHERE MOUID = 0) OMp
+                               ON Doc.Id = OMp.documentid
+                        WHERE Mp.ProviderID = @ProviderID
+                          AND Doc.Status = 1
+                          AND Mp.Status  = 1
+                          AND Doc.FileName LIKE '%.pdf'
+                          " + mouFilter + @"
+                        GROUP BY Doc.Id, Doc.SystemFileName, Doc.FileName
+                        ORDER BY MAX(Doc.CreatedDateTime) DESC";
+
                     cmd.Parameters.AddWithValue("@ProviderID", providerId);
-                    cmd.Parameters.AddWithValue("@MOUID",      mouId);
-                    cmd.Parameters.AddWithValue("@Flag",        0);
+                    if (hasMou) cmd.Parameters.AddWithValue("@MOUID", mouId);
+
                     using (var rdr = cmd.ExecuteReader())
                     {
                         while (rdr.Read())
                         {
-                            string fileType = rdr.IsDBNull(rdr.GetOrdinal("FileType")) ? "" : rdr["FileType"].ToString().ToLower();
-                            if (!fileType.Contains("pdf")) continue;
-                            string sysFileName = rdr["SystemFileName"].ToString();
-                            string isOldDoc    = rdr.IsDBNull(rdr.GetOrdinal("isOldDoc")) ? "no" : rdr["isOldDoc"].ToString().ToLower();
-                            DateTime updateDate = rdr.IsDBNull(rdr.GetOrdinal("UpdateDate")) ? DateTime.MinValue : Convert.ToDateTime(rdr["UpdateDate"]);
+                            string sysFileName = rdr["SystemFileName"]?.ToString();
+                            if (string.IsNullOrWhiteSpace(sysFileName)) continue;
+
+                            string isOldDoc = rdr["IsOldDoc"]?.ToString().ToLower() ?? "no";
+
+                            DateTime updateDate = rdr.IsDBNull(rdr.GetOrdinal("UpdateDate"))
+                                ? DateTime.MinValue
+                                : Convert.ToDateTime(rdr["UpdateDate"]);
+
                             tariffFiles.Add(System.Tuple.Create(sysFileName, updateDate, isOldDoc, sysFileName));
                         }
                     }
@@ -9861,7 +9920,8 @@ namespace Enrollment.Controllers
             string tpaProcedureId = null,
             string icdCodeStr     = null,
             string eligibleAmount = null,
-            string packageAmount  = null)
+            string packageAmount  = null,
+            string claimType      = null)   // Phase 6: disease type passed from JS; null = fall back to cataract default
         {
             try
             {
@@ -10089,10 +10149,26 @@ namespace Enrollment.Controllers
 
                         if (treatmentType == 0) treatmentType = 66;  // Default to Surgical (cataract uses 66)
 
+                        // ═══════ PHASE 6 — Fetch BillingType from ClaimAI rules registry ═══════
+                        // Default to "cataract" if caller didn't pass claimType — preserves pre-Phase-6
+                        // behavior (BillingType=201 hardcoded). The ClaimAIRulesClient helper class
+                        // (defined at end of file) caches responses for 5 min and falls back to safe
+                        // defaults on any error, so coding saves continue working during ClaimAI outages.
+                        var resolvedClaimType  = string.IsNullOrWhiteSpace(claimType) ? "cataract" : claimType.Trim().ToLowerInvariant();
+                        int  billingType       = ClaimAIRulesClient.GetBillingType(resolvedClaimType);
+                        bool packageRateIsNull = ClaimAIRulesClient.GetPackageRateNull(resolvedClaimType);
+                        System.Diagnostics.Debug.WriteLine(
+                            "[ClaimAI] Coding row config for " + resolvedClaimType +
+                            ": BillingType=" + billingType +
+                            ", PackageRateNull=" + packageRateIsNull);
+                        // ═══════ END PHASE 6 ADDITION ═══════
+
                         // Step 2: INSERT with full set of columns matching working cataract rows.
                         // Column names taken from cataract row sample: TPALevel1, TPALevel2, TPALevel3,
                         // PCSCode, PCSDescription, TreatementTypeID_19, Createddatetime, isGipsa,
-                        // isDayCare, isPED, PackageRatio, BillingType_P51=201.
+                        // isDayCare, isPED, PackageRatio.
+                        // Phase 6: BillingType_P51 and PackageRate now come from @bt and @pkgRate parameters
+                        // sourced from the ClaimAI rules registry (was hardcoded 201 and NULL).
                         ins.CommandText = @"
                             INSERT INTO ClaimsCoding
                                 (ClaimID, Slno, TPAProcedureID,
@@ -10108,9 +10184,9 @@ namespace Enrollment.Controllers
                                 (@cid, @slno, @tpa,
                                  @l1, @l2, @l3,
                                  @pcs, @pcsDesc, @tt,
-                                 @bill, NULL, 100.00, 0,
+                                 @bill, @pkgRate, 100.00, 0,
                                  @elig, @dis, @pay,
-                                 @icd, 201,
+                                 @icd, @bt,
                                  0, 0, 0,
                                  0, GETDATE(), @region)";
                         ins.Parameters.AddWithValue("@cid",     claimIdLong);
@@ -10128,6 +10204,9 @@ namespace Enrollment.Controllers
                         ins.Parameters.AddWithValue("@pay",     eligibleAmt > 0 ? (object)eligibleAmt : DBNull.Value);
                         ins.Parameters.AddWithValue("@icd",     icdNumericId > 0 ? (object)icdNumericId : DBNull.Value);
                         ins.Parameters.AddWithValue("@region",  userRegionId);
+                        // Phase 6: BillingType and PackageRate driven by claim type
+                        ins.Parameters.AddWithValue("@bt",      billingType);
+                        ins.Parameters.AddWithValue("@pkgRate", packageRateIsNull ? (object)DBNull.Value : (object)0m);
 
                         var newRowIdObj = ins.ExecuteScalar();
                         long newRowId   = newRowIdObj != null && newRowIdObj != DBNull.Value
@@ -10630,5 +10709,201 @@ namespace Enrollment.Controllers
 
         #endregion ClaimAI Metrics
 
+    }
+
+    /// <summary>
+    /// PHASE 6 — Lightweight client that fetches disease-rules from ClaimAI's
+    /// /api/rules/[claimType] endpoint and caches the result in memory.
+    ///
+    /// Used by SaveCodingRowForClaimAI to get the right BillingType_P51 value
+    /// per disease (201 for cataract, 202 for maternity, etc.) instead of the
+    /// previously hardcoded literal.
+    ///
+    /// Cache TTL: 5 minutes per claim type. Falls back to safe hardcoded
+    /// defaults if the fetch fails — coding saves continue working during
+    /// a ClaimAI outage.
+    /// </summary>
+    internal static class ClaimAIRulesClient
+    {
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, CachedRules> _cache
+            = new System.Collections.Concurrent.ConcurrentDictionary<string, CachedRules>();
+        private static readonly TimeSpan _cacheTtl = TimeSpan.FromMinutes(5);
+
+        /// <summary>
+        /// Get the BillingType_P51 value for a claim type.
+        /// Falls back to 201 (cataract default) on any error — matches pre-Phase-6 hardcoded value.
+        /// </summary>
+        public static int GetBillingType(string claimType)
+        {
+            try
+            {
+                var rules = GetRulesCached(claimType);
+                return rules != null && rules.codingRow != null ? rules.codingRow.billingType : 201;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    "[ClaimAIRulesClient] GetBillingType failed for " +
+                    (claimType ?? "(null)") + ": " + ex.Message);
+                return 201;
+            }
+        }
+
+        /// <summary>
+        /// Get whether PackageRate should be NULL for this claim type.
+        /// True for maternity (bill only), false for cataract (bill + package).
+        /// </summary>
+        public static bool GetPackageRateNull(string claimType)
+        {
+            try
+            {
+                var rules = GetRulesCached(claimType);
+                return rules != null && rules.codingRow != null && rules.codingRow.packageRateNull;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Get the treatment type (TreatementTypeID_19). Defaults to 66 (Surgical).
+        /// </summary>
+        public static int GetTreatmentType(string claimType)
+        {
+            try
+            {
+                var rules = GetRulesCached(claimType);
+                return rules != null && rules.codingRow != null ? rules.codingRow.treatmentType : 66;
+            }
+            catch
+            {
+                return 66;
+            }
+        }
+
+        /// <summary>
+        /// Get the default facility ID for the Approved Accommodation dropdown.
+        /// Returns null if the disease has no default (e.g. maternity).
+        /// </summary>
+        public static int? GetDefaultFacilityId(string claimType)
+        {
+            try
+            {
+                var rules = GetRulesCached(claimType);
+                return rules != null && rules.codingRow != null ? rules.codingRow.defaultFacilityId : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        // ───────────────────────────────────────────────────────────────
+        // Internal — cache lookup with TTL
+        // ───────────────────────────────────────────────────────────────
+        private static RulesPayload GetRulesCached(string claimType)
+        {
+            var key = string.IsNullOrWhiteSpace(claimType) ? "other" : claimType.Trim().ToLowerInvariant();
+
+            CachedRules cached;
+            if (_cache.TryGetValue(key, out cached) && cached.FetchedAt + _cacheTtl > DateTime.UtcNow)
+            {
+                return cached.Rules;
+            }
+
+            // Cache miss or expired — fetch fresh
+            var fresh = FetchRules(key);
+            if (fresh != null)
+            {
+                _cache[key] = new CachedRules { Rules = fresh, FetchedAt = DateTime.UtcNow };
+            }
+            return fresh;
+        }
+
+        private static RulesPayload FetchRules(string claimType)
+        {
+            // Read base URL from Web.config — same key used elsewhere in MedicalScrutinyController
+            var baseUrl = System.Configuration.ConfigurationManager.AppSettings["ClaimAIUrl"];
+            if (string.IsNullOrWhiteSpace(baseUrl))
+            {
+                System.Diagnostics.Debug.WriteLine("[ClaimAIRulesClient] ClaimAIUrl not configured in Web.config.");
+                return null;
+            }
+
+            // ─── Production HTTPS setup ─────────────────────────────────────
+            // Mirror the EXACT pattern used by every other HTTPS call in this
+            // controller (see lines 6161, 6261, 6308, 7451, 7686 for reference).
+            // Without these two settings, the call works on localhost but fails
+            // in production with "Could not establish trust relationship for the
+            // SSL/TLS secure channel" or "TLS handshake failed".
+            //
+            // - SecurityProtocol: enable TLS 1.2 + 1.1 + 1.0 so any TLS version
+            //   the network path can negotiate works (some intercepting proxies
+            //   downgrade from 1.2).
+            // - ServerCertificateValidationCallback: accept all certs. The
+            //   ClaimAI EC2 may use a self-signed or non-public CA cert, and
+            //   the rest of this controller already bypasses validation —
+            //   we follow the same pattern for consistency.
+            System.Net.ServicePointManager.SecurityProtocol =
+                System.Net.SecurityProtocolType.Tls12 |
+                System.Net.SecurityProtocolType.Tls11 |
+                System.Net.SecurityProtocolType.Tls;
+            System.Net.ServicePointManager.ServerCertificateValidationCallback =
+                (sender, cert, chain, errors) => true;
+            // ────────────────────────────────────────────────────────────────
+
+            var url = baseUrl.TrimEnd('/') + "/api/rules/" + Uri.EscapeDataString(claimType);
+
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            request.Method  = "GET";
+            request.Timeout = 5000;  // 5 sec — don't block save flow on slow ClaimAI
+            request.Accept  = "application/json";
+            request.UserAgent = "Spectra-ClaimAIRulesClient/1.0";  // helps identify in ClaimAI logs
+
+            try
+            {
+                using (var response = (System.Net.HttpWebResponse)request.GetResponse())
+                using (var stream   = response.GetResponseStream())
+                using (var reader   = new System.IO.StreamReader(stream))
+                {
+                    var json = reader.ReadToEnd();
+                    var serializer = new System.Web.Script.Serialization.JavaScriptSerializer();
+                    var parsed = serializer.Deserialize<RulesPayload>(json);
+                    return parsed;
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    "[ClaimAIRulesClient] Fetch failed for " + claimType + ": " + ex.Message);
+                return null;
+            }
+        }
+
+        // ───────────────────────────────────────────────────────────────
+        // DTO shapes — only the fields we consume in C#
+        // ───────────────────────────────────────────────────────────────
+        private class CachedRules
+        {
+            public RulesPayload Rules { get; set; }
+            public DateTime FetchedAt { get; set; }
+        }
+
+        public class RulesPayload
+        {
+            public string type  { get; set; }
+            public string label { get; set; }
+            public CodingRowPayload codingRow { get; set; }
+        }
+
+        public class CodingRowPayload
+        {
+            public int  billingType       { get; set; }
+            public int  treatmentType     { get; set; }
+            public decimal packageRatio   { get; set; }
+            public int? defaultFacilityId { get; set; }
+            public bool packageRateNull   { get; set; }
+        }
     }
 }
