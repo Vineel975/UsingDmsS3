@@ -1,5 +1,4 @@
-SELECT TOP 1 Slno
-FROM Claimsdetails WITH(NOLOCK)
-WHERE ClaimID = 2024100600003
-  AND ISNULL(Deleted, 0) = 0
-ORDER BY Slno;
+EXEC USP_ClaimMedicalScrutiny_Retrieve
+    @ClaimID       = 2024100600003,
+    @SlNo          = 1,
+    @IsFrmArchived = 0;
